@@ -1,0 +1,20 @@
+{
+  "base": "/nfs",
+  "hosts": {
+    "examplehost": {
+      "server": "examplehost.example.net",
+      "options": "nfsvers=4.1,nocallback,tcp,rw,noresvport,hard,browse,noowners,rsize=1048576,wsize=1048576,rdirplus",
+      "shares": {
+        "build": "/home/me/build",
+        "devel": "/home/me/devel"
+      }
+    },
+    "examplevm": {
+      "server": "examplevm.local",
+      "options": "nfsvers=3,proto=tcp6,rw,noresvport,hard,intr,deadtimeout=300,browse,noowners,rsize=131072,wsize=131072",
+      "shares": {
+        "devel": "/home/me/devel"
+      }
+    }
+  }
+}

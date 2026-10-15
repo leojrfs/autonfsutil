@@ -1,0 +1,289 @@
+#!/usr/bin/python3
+"""autonfsutil: declarative NFS automounts for macOS, driven by a JSON config.
+
+Reads ~/.config/autonfsutil/mounts.json (see mounts.json.example) and sets up
+each host's shares under a common base directory (default /nfs) as macOS
+automountd direct-map entries: mounted on first access, unmounted when idle.
+
+macOS upgrades reset /etc/auto_master; "setup" also installs a small
+LaunchDaemon that restores the autonfsutil line at boot and whenever the file
+changes.
+
+Only /usr/bin/python3 and tools shipped with macOS are used, so this file can
+be shared as-is. Note that link-local IPv6 servers need "proto=tcp6" in their
+options, or automountd probes them over IPv4 only and never reaches them.
+
+Usage:
+  autonfsutil setup [--config PATH]   install/refresh the automount maps (uses sudo)
+  autonfsutil status [--config PATH]  mount (trigger) and show each configured share
+"""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import subprocess
+import sys
+
+DATA_VOLUME = "/System/Volumes/Data"
+AUTO_MASTER = "/etc/auto_master"
+MAP_PATH = "/etc/auto_autonfsutil"
+SYNTHETIC_PATH = "/etc/synthetic.d/autonfsutil.conf"
+TRIGGER_TIMEOUT = 10
+MASTER_LINE = "/-                     %s" % MAP_PATH
+LAUNCHD_LABEL = "local.autonfsutil-repair"
+LAUNCHD_PLIST = "/Library/LaunchDaemons/%s.plist" % LAUNCHD_LABEL
+
+# macOS upgrades restore the stock /etc/auto_master, dropping our line. This
+# job re-adds it at boot and whenever the file changes. It is self-contained
+# on purpose: root never executes anything from a user-writable location.
+REPAIR_SCRIPT = (
+    'grep -qxF "{line}" /etc/auto_master || '
+    "{{ printf '\\n%s\\n' \"{line}\" >> /etc/auto_master; "
+    "/usr/sbin/automount -cv; }}"
+).format(line=MASTER_LINE)
+
+PLIST_TEMPLATE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>{script}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>WatchPaths</key>
+    <array>
+        <string>/etc/auto_master</string>
+    </array>
+</dict>
+</plist>
+"""
+
+
+def fail(message):
+    """Print an error and exit; all fatal paths funnel through here."""
+    print("[E]: %s" % message, file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config(path):
+    """Load and validate mounts.json, exiting with a clear error if invalid."""
+    try:
+        with open(path) as fh:
+            config = json.load(fh)
+    except OSError as exc:
+        fail("cannot read config %s: %s" % (path, exc))
+    except json.JSONDecodeError as exc:
+        fail("invalid JSON in config %s: %s" % (path, exc))
+    if not isinstance(config, dict):
+        fail("config must be a JSON object")
+    base = config.get("base", "/nfs")
+    if not isinstance(base, str) or not re.fullmatch(r"/[^/]+", base):
+        fail("base must be a single absolute component, e.g. /nfs")
+    config["base"] = base
+    hosts = config.get("hosts")
+    if not isinstance(hosts, dict) or not hosts:
+        fail("config has no hosts")
+    for name, host in hosts.items():
+        if not isinstance(host, dict):
+            fail("hosts.%s must be an object" % name)
+        for key in ("server", "options", "shares"):
+            if key not in host:
+                fail("hosts.%s is missing '%s'" % (name, key))
+        if not isinstance(host["server"], str) or not host["server"]:
+            fail("hosts.%s.server must be a non-empty string" % name)
+        if not isinstance(host["options"], str) or not host["options"]:
+            fail("hosts.%s.options must be a non-empty string" % name)
+        if not isinstance(host["shares"], dict) or not host["shares"]:
+            fail("hosts.%s.shares must be a non-empty object" % name)
+        for share, remote in host["shares"].items():
+            if not isinstance(remote, str) or not remote:
+                fail("hosts.%s.shares.%s must be a non-empty string" %
+                     (name, share))
+    return config
+
+
+def physical_base(config):
+    """On-disk location of the base directory, which /<base> symlinks to."""
+    return DATA_VOLUME + config["base"]
+
+
+def iter_shares(config):
+    """Yield (host name, host, share name, remote path, mount point) tuples."""
+    for name, host in config["hosts"].items():
+        for share, remote in host["shares"].items():
+            target = "%s/%s/%s" % (physical_base(config), name, share)
+            yield name, host, share, remote, target
+
+
+def is_mounted(target):
+    """True if an NFS share is currently mounted on the given mount point."""
+    out = subprocess.run(["mount", "-t", "nfs"], capture_output=True, text=True).stdout
+    return any(" on %s " % target in line for line in out.splitlines())
+
+
+def nfsstat_mount_options():
+    """Map each NFS mount point to the option set it was originally mounted with."""
+    out = subprocess.run(["nfsstat", "-m"], capture_output=True, text=True).stdout
+    result, current = {}, None
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            current = line.split(" from ")[0]
+        elif current and line.strip().startswith("NFS parameters:") \
+                and current not in result:
+            result[current] = set(line.split(":", 1)[1].strip().split(","))
+    return result
+
+
+def mount_option_to_nfsstat(option):
+    """Translate a configured mount option to the forms nfsstat -m may echo."""
+    option = option.replace("nfsvers=", "vers=")
+    # nfsstat echoes "tcp" as-is but keeps the prefix on "proto=tcp6", so a
+    # transport can show up under either spelling.
+    return {option, "proto=%s" % option}
+
+
+def needs_remount(wanted, actual):
+    """True if a configured option is missing from what the mount was made with."""
+    return any(not (mount_option_to_nfsstat(o) & actual)
+               for o in wanted.split(",") if "=" in o or o in ("tcp", "nocallback"))
+
+
+def existing_map_entries():
+    """Read the current direct map to detect entries whose options changed."""
+    try:
+        with open(MAP_PATH) as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        fail("cannot read %s: %s" % (MAP_PATH, exc))
+    result = {}
+    for line in lines:
+        fields = line.split(None, 1)
+        if len(fields) == 2:
+            result[fields[0]] = line.strip()
+    return result
+
+
+def run_as_root(*argv, **kwargs):
+    """Run a command as root, aborting if it fails."""
+    if subprocess.run(["sudo", *argv], **kwargs).returncode != 0:
+        fail("command failed: sudo %s" % " ".join(argv))
+
+
+def write_as_root(path, content):
+    """Write a root-owned file via sudo tee, aborting if it fails."""
+    run_as_root("tee", path, input=content, text=True,
+                stdout=subprocess.DEVNULL)
+
+
+def cmd_setup(config):
+    """Install or refresh the synthetic symlink, automount maps and LaunchDaemon."""
+    base = config["base"]
+
+    # Make the base directory appear at / via a synthetic symlink.
+    run_as_root("mkdir", "-p", physical_base(config))
+    run_as_root("mkdir", "-p", "/etc/synthetic.d")
+    write_as_root(SYNTHETIC_PATH,
+               "%s\t%s\n" % (base.lstrip("/"), physical_base(config)))
+
+    # Route the base subtree through our automountd map.
+    pattern = re.compile(r"^\s*/-\s+%s(\s|$)" % re.escape(MAP_PATH))
+    with open(AUTO_MASTER) as fh:
+        master = [line for line in fh if not pattern.match(line)]
+    if master and not master[-1].endswith("\n"):
+        master[-1] += "\n"
+    master.append(MASTER_LINE + "\n")
+    write_as_root(AUTO_MASTER, "".join(master))
+
+    live = nfsstat_mount_options()
+    previous_map = existing_map_entries()
+    map_lines = []
+    for _name, host, _share, remote, target in iter_shares(config):
+        actual = live.get(target)
+        virtual = config["base"] + target[len(physical_base(config)):]
+        map_line = "%s    -%s nfs://%s:%s" % (
+            virtual, host["options"], host["server"], remote)
+        changed = (virtual in previous_map
+                   and previous_map[virtual] != map_line)
+        if actual is not None and (changed or
+                                   needs_remount(host["options"], actual)):
+            print("[I]: configuration changed for %s, unmounting" % target)
+            if subprocess.run(["sudo", "umount", target]).returncode != 0:
+                print("[W]: %s is busy; unmount it manually to apply new options"
+                      % target)
+        if not is_mounted(target):
+            run_as_root("mkdir", "-p", target)
+        map_lines.append(map_line + "\n")
+    write_as_root(MAP_PATH, "".join(map_lines))
+
+    run_as_root("automount", "-cv")
+
+    subprocess.run(["sudo", "launchctl", "bootout", "system/%s" % LAUNCHD_LABEL],
+                   stderr=subprocess.DEVNULL)
+    write_as_root(LAUNCHD_PLIST, PLIST_TEMPLATE.format(label=LAUNCHD_LABEL,
+                                                    script=REPAIR_SCRIPT))
+    run_as_root("launchctl", "bootstrap", "system", LAUNCHD_PLIST)
+    print("[I]: autonfsutil setup complete. Reboot only if %s does not exist yet." % base)
+
+
+def trigger_automount(target):
+    """Touch a share so automountd mounts it, without hanging on a dead server."""
+    process = None
+    try:
+        process = subprocess.Popen(["ls", target], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        process.wait(timeout=TRIGGER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # Do not wait after SIGKILL: a process blocked in uninterruptible NFS
+        # I/O cannot be reaped until the server responds.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    return is_mounted(target)
+
+
+def cmd_status(config):
+    """Trigger every configured share and report whether it mounted."""
+    # Automounts only mount on first access, so trigger them before reporting.
+    shares = list(iter_shares(config))
+    if not shares:
+        print("[I]: no configured shares")
+        return
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(shares)) as pool:
+        results = list(pool.map(lambda share: trigger_automount(share[4]), shares))
+    for (name, host, share, remote, _target), share_mounted in zip(shares, results):
+        state = "mounted" if share_mounted else "unreachable"
+        print("%-18s %-11s %s:%s" %
+              ("%s/%s" % (name, share), state, host["server"], remote))
+
+
+def main():
+    """Parse arguments and dispatch to the setup or status command."""
+    parser = argparse.ArgumentParser(
+        prog="autonfsutil", description="Declarative NFS automounts for macOS.")
+    parser.add_argument("command", choices=("setup", "status"))
+    parser.add_argument("--config",
+                        default=os.path.expanduser("~/.config/autonfsutil/mounts.json"),
+                        help="config file (default: %(default)s)")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    if args.command == "setup":
+        cmd_setup(config)
+    else:
+        cmd_status(config)
+
+
+if __name__ == "__main__":
+    main()
