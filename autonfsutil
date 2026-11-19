@@ -15,7 +15,8 @@ options, or automountd probes them over IPv4 only and never reaches them.
 
 Usage:
   autonfsutil setup [--config PATH]   install/refresh the automount maps (uses sudo)
-  autonfsutil status [--config PATH]  mount (trigger) and show each configured share
+  autonfsutil status [--config PATH]  show each configured share without mounting
+  autonfsutil mount [--config PATH]   mount (trigger) and show each configured share
 """
 
 import argparse
@@ -234,8 +235,8 @@ def trigger_automount(target):
     """Touch a share so automountd mounts it, without hanging on a dead server."""
     process = None
     try:
-        process = subprocess.Popen(["ls", target], stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL)
+        process = subprocess.Popen(["ls", "-d", target + "/."],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         process.wait(timeout=TRIGGER_TIMEOUT)
     except subprocess.TimeoutExpired:
         # Do not wait after SIGKILL: a process blocked in uninterruptible NFS
@@ -247,9 +248,8 @@ def trigger_automount(target):
     return is_mounted(target)
 
 
-def cmd_status(config):
+def cmd_mount(config):
     """Trigger every configured share and report whether it mounted."""
-    # Automounts only mount on first access, so trigger them before reporting.
     shares = list(iter_shares(config))
     if not shares:
         print("[I]: no configured shares")
@@ -262,11 +262,19 @@ def cmd_status(config):
               ("%s/%s" % (name, share), state, host["server"], remote))
 
 
+def cmd_status(config):
+    """Report each configured share without triggering automounts."""
+    for name, host, share, remote, target in iter_shares(config):
+        state = "mounted" if is_mounted(target) else "unmounted"
+        print("%-18s %-11s %s:%s" %
+              ("%s/%s" % (name, share), state, host["server"], remote))
+
+
 def main():
-    """Parse arguments and dispatch to the setup or status command."""
+    """Parse arguments and dispatch to the setup, status or mount command."""
     parser = argparse.ArgumentParser(
         prog="autonfsutil", description="Declarative NFS automounts for macOS.")
-    parser.add_argument("command", choices=("setup", "status"))
+    parser.add_argument("command", choices=("setup", "status", "mount"))
     parser.add_argument("--config",
                         default=os.path.expanduser("~/.config/autonfsutil/mounts.json"),
                         help="config file (default: %(default)s)")
@@ -275,6 +283,8 @@ def main():
     config = load_config(args.config)
     if args.command == "setup":
         cmd_setup(config)
+    elif args.command == "mount":
+        cmd_mount(config)
     else:
         cmd_status(config)
 
