@@ -233,9 +233,7 @@ def cmd_setup(config):
         if actual is not None and (changed or
                                    needs_remount(host["options"], actual)):
             print("[I]: configuration changed for %s, unmounting" % target)
-            if subprocess.run(["sudo", "umount", target]).returncode != 0:
-                print("[W]: %s is busy; unmount it manually to apply new options"
-                      % target)
+            run_as_root("umount", target)
         if not is_mounted(target):
             run_as_root("mkdir", "-p", target)
         map_lines.append(map_line + "\n")
@@ -243,10 +241,10 @@ def cmd_setup(config):
 
     run_as_root("automount", "-cv")
 
-    subprocess.run(["sudo", "launchctl", "bootout", "system/%s" % LAUNCHD_LABEL],
-                   stderr=subprocess.DEVNULL)
     write_as_root(LAUNCHD_PLIST, PLIST_TEMPLATE.format(label=LAUNCHD_LABEL,
                                                     script=REPAIR_SCRIPT))
+    subprocess.run(["sudo", "launchctl", "bootout", "system/%s" % LAUNCHD_LABEL],
+                   stderr=subprocess.DEVNULL)
     run_as_root("launchctl", "bootstrap", "system", LAUNCHD_PLIST)
     print("[I]: autonfsutil setup complete. Reboot only if %s does not exist yet." % base)
 
