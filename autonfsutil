@@ -85,14 +85,17 @@ def load_config(path):
         fail("invalid JSON in config %s: %s" % (path, exc))
     if not isinstance(config, dict):
         fail("config must be a JSON object")
+    component = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
     base = config.get("base", "/nfs")
-    if not isinstance(base, str) or not re.fullmatch(r"/[^/]+", base):
+    if not isinstance(base, str) or not re.fullmatch("/" + component, base):
         fail("base must be a single absolute component, e.g. /nfs")
     config["base"] = base
     hosts = config.get("hosts")
     if not isinstance(hosts, dict) or not hosts:
         fail("config has no hosts")
     for name, host in hosts.items():
+        if not re.fullmatch(component, name):
+            fail("invalid host name: %s" % name)
         if not isinstance(host, dict):
             fail("hosts.%s must be an object" % name)
         for key in ("server", "options", "shares"):
@@ -105,6 +108,8 @@ def load_config(path):
         if not isinstance(host["shares"], dict) or not host["shares"]:
             fail("hosts.%s.shares must be a non-empty object" % name)
         for share, remote in host["shares"].items():
+            if not re.fullmatch(component, share):
+                fail("invalid share name: %s" % share)
             if not isinstance(remote, str) or not remote:
                 fail("hosts.%s.shares.%s must be a non-empty string" %
                      (name, share))
