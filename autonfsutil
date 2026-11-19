@@ -22,6 +22,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -43,30 +44,6 @@ REPAIR_SCRIPT = (
     "{{ printf '\\n%s\\n' \"{line}\" >> /etc/auto_master; "
     "/usr/sbin/automount -cv; }}"
 ).format(line=MASTER_LINE)
-
-PLIST_TEMPLATE = """\
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/sh</string>
-        <string>-c</string>
-        <string>{script}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>WatchPaths</key>
-    <array>
-        <string>/etc/auto_master</string>
-    </array>
-</dict>
-</plist>
-"""
-
 
 def fail(message):
     """Print an error and exit; all fatal paths funnel through here."""
@@ -241,8 +218,12 @@ def cmd_setup(config):
 
     run_as_root("automount", "-cv")
 
-    write_as_root(LAUNCHD_PLIST, PLIST_TEMPLATE.format(label=LAUNCHD_LABEL,
-                                                    script=REPAIR_SCRIPT))
+    write_as_root(LAUNCHD_PLIST, plistlib.dumps({
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": ["/bin/sh", "-c", REPAIR_SCRIPT],
+        "RunAtLoad": True,
+        "WatchPaths": [AUTO_MASTER],
+    }).decode())
     subprocess.run(["sudo", "launchctl", "bootout", "system/%s" % LAUNCHD_LABEL],
                    stderr=subprocess.DEVNULL)
     run_as_root("launchctl", "bootstrap", "system", LAUNCHD_PLIST)
