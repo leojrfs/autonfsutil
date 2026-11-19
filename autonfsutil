@@ -181,14 +181,24 @@ def existing_map_entries():
 
 def run_as_root(*argv, **kwargs):
     """Run a command as root, aborting if it fails."""
-    if subprocess.run(["sudo", *argv], **kwargs).returncode != 0:
+    process = subprocess.run(["sudo", *argv], **kwargs)
+    if process.returncode != 0:
         fail("command failed: sudo %s" % " ".join(argv))
+    return process
 
 
 def write_as_root(path, content):
-    """Write a root-owned file via sudo tee, aborting if it fails."""
-    run_as_root("tee", path, input=content, text=True,
-                stdout=subprocess.DEVNULL)
+    """Publish a complete root-owned file by atomic rename on its filesystem."""
+    temporary = run_as_root("mktemp", path + ".XXXXXX",
+                            capture_output=True, text=True).stdout.strip()
+    try:
+        run_as_root("tee", temporary, input=content, text=True,
+                    stdout=subprocess.DEVNULL)
+        run_as_root("chown", "root:wheel", temporary)
+        run_as_root("chmod", "644", temporary)
+        run_as_root("mv", "-f", temporary, path)
+    finally:
+        run_as_root("rm", "-f", temporary)
 
 
 def cmd_setup(config):
